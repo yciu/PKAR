@@ -90,3 +90,19 @@ def iter_ids(
             base.next_u32()
 
     return candidates()
+
+
+def search_ids(
+    state: Sequence[int], target: int, *, start: int = 0, stop: int
+) -> Iterator[BDSPIDResult]:
+    """Lazily match numeric displayed IDs in [start, stop), keeping duplicates.
+
+    Validate and snapshot inputs immediately. Leading zeros are presentation
+    only: format display_id with six decimal digits when displaying.
+    """
+    if isinstance(target, bool) or not isinstance(target, int):
+        raise TypeError("target must be an integer, not a boolean")
+    if not 0 <= target <= 999999:
+        raise ValueError("target must be between 0 and 999999 inclusive")
+    candidates = iter_ids(state, start=start, stop=stop)
+    return (result for result in candidates if result.display_id == target)

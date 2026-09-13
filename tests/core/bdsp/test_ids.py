@@ -2,8 +2,9 @@
 
 from dataclasses import FrozenInstanceError
 import unittest
+from unittest.mock import Mock, patch
 
-from core.bdsp.ids import BDSPIDResult, generate_id, iter_ids
+from core.bdsp.ids import BDSPIDResult, generate_id, iter_ids, search_ids
 
 
 class BDSPIDTests(unittest.TestCase):
@@ -221,6 +222,148 @@ class BDSPIDTests(unittest.TestCase):
                     iter_ids(state, stop=1)
                 with self.assertRaises(error):
                     iter_ids(state, stop=0)
+
+
+class BDSPIDSearchTests(unittest.TestCase):
+    A = (1, 2, 3, 4)
+    D = (0xA4848080, 0, 0, 0)
+    F = (0xA5A43414, 0x04809010, 0x04809010, 0x04809010)
+    F_END = (0x80000000, 0x80000000, 0x80000000, 0x00801000)
+
+    def test_targets_and_six_digit_formatting(self):
+        cases = (
+            ((0x82605DF2, 0, 0, 0), 999999, "999999"),
+            ((0x9DA3A58D, 0, 0, 0), 0, "000000"),
+            (self.D, 4096, "004096"),
+        )
+        for state, target, formatted in cases:
+            with self.subTest(target=target):
+                results = list(search_ids(state, target, stop=1))
+                self.assertEqual([r.advance for r in results], [0])
+                self.assertEqual(results[0].display_id, target)
+                self.assertEqual(f"{results[0].display_id:06d}", formatted)
+
+    def test_no_match(self):
+        self.assertEqual(list(search_ids(self.A, 999999, stop=3)), [])
+
+    def test_nonzero_match(self):
+        results = list(search_ids(self.A, 489823, stop=3))
+        self.assertEqual(results, [BDSPIDResult(
+            1, 0x8000181F, (0x0000181F,), (3, 4, 0x0000080D, 0x0000181F)
+        )])
+
+    def test_interval_boundaries(self):
+        for start, stop, advances in (
+            (1, 2, [1]),
+            (0, 1, []),
+            (2, 3, []),
+            (1, 1, []),
+        ):
+            with self.subTest(start=start, stop=stop):
+                results = search_ids(self.A, 489823, start=start, stop=stop)
+                self.assertEqual([r.advance for r in results], advances)
+
+    def test_duplicates_preserve_order_and_complete_traces(self):
+        results = list(search_ids(self.F, 876352, stop=5))
+        self.assertEqual([r.advance for r in results], [0, 1, 2, 3, 4])
+        for advance, result in enumerate(results):
+            with self.subTest(advance=advance):
+                self.assertIsInstance(result, BDSPIDResult)
+                self.assertEqual(result, BDSPIDResult(
+                    advance, 0x80801000,
+                    (0x80000000,) * (4 - advance) + (0x00801000,), self.F_END,
+                ))
+                self.assertEqual(result.calls_consumed, 5 - advance)
+
+    def test_retries_extend_past_stop(self):
+        self.assertEqual(
+            list(search_ids(self.F, 876352, start=2, stop=3)),
+            [BDSPIDResult(
+                2, 0x80801000, (0x80000000, 0x80000000, 0x00801000), self.F_END
+            )],
+        )
+
+    def test_leading_zero_match_retains_retry_trace(self):
+        self.assertEqual(list(search_ids(self.D, 4096, stop=1)), [BDSPIDResult(
+            0, 0x1000, (0x80000000, 0x80001000),
+            (0, 0, 0x80000000, 0x80001000),
+        )])
+
+    def test_filter_is_lazy_and_returns_original_objects(self):
+        originals = list(iter_ids(self.F, stop=5))
+        draw = Mock(side_effect=originals)
+        source = (draw() for _ in originals)
+        with patch("core.bdsp.ids.iter_ids", return_value=source) as iterator:
+            results = search_ids(self.F, 876352, stop=5)
+            iterator.assert_called_once_with(self.F, start=0, stop=5)
+            draw.assert_not_called()
+            for original, result in zip(originals, results, strict=True):
+                self.assertIs(result, original)
+                self.assertIs(result.raw_outputs, original.raw_outputs)
+                self.assertIs(result.state_after, original.state_after)
+
+    def test_invalid_target_types_raise_immediately(self):
+        for target in (True, False, 999999.0, "999999", "000000", None):
+            for stop in (0, 1):
+                with self.subTest(target=target, stop=stop):
+                    with self.assertRaises(TypeError):
+                        search_ids(self.A, target, stop=stop)
+
+    def test_invalid_target_values_raise_immediately(self):
+        for target in (-1, 1000000):
+            for stop in (0, 1):
+                with self.subTest(target=target, stop=stop):
+                    with self.assertRaises(ValueError):
+                        search_ids(self.A, target, stop=stop)
+
+    def test_invalid_states_raise_immediately_including_empty_intervals(self):
+        cases = (
+            ((), ValueError),
+            ((1, 2, 3), ValueError),
+            ((1, 2, 3, 4, 5), ValueError),
+            ((True, 2, 3, 4), TypeError),
+            ((1, 2, False, 4), TypeError),
+            ((1, 2, 3, 4.0), TypeError),
+            ((1, "2", 3, 4), TypeError),
+            ((-1, 2, 3, 4), ValueError),
+            ((1, 2, 3, 0x100000000), ValueError),
+            (None, TypeError),
+        )
+        for state, error in cases:
+            for start, stop in ((0, 1), (1, 1)):
+                with self.subTest(state=state, start=start, stop=stop):
+                    with self.assertRaises(error):
+                        search_ids(state, 489823, start=start, stop=stop)
+
+    def test_invalid_intervals_raise_immediately(self):
+        for value in (True, False, 1.0, "1", None):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    search_ids(self.A, 489823, start=value, stop=3)
+                with self.assertRaises(TypeError):
+                    search_ids(self.A, 489823, stop=value)
+                with self.assertRaises(TypeError):
+                    search_ids(self.A, 489823, start=value, stop=value)
+        for start, stop in ((-1, 1), (0, -1), (-1, -1), (2, 1)):
+            with self.subTest(start=start, stop=stop):
+                with self.assertRaises(ValueError):
+                    search_ids(self.A, 489823, start=start, stop=stop)
+
+    def test_mutable_input_is_snapshotted_immediately(self):
+        words = list(self.A)
+        results = search_ids(words, 489823, stop=3)
+        words[:] = [0, 0, 0, 0]
+        self.assertEqual(list(results), [BDSPIDResult(
+            1, 0x8000181F, (0x0000181F,), (3, 4, 0x0000080D, 0x0000181F)
+        )])
+        self.assertEqual(words, [0, 0, 0, 0])
+
+    def test_input_is_not_mutated(self):
+        words = list(self.F)
+        results = search_ids(words, 876352, start=2, stop=3)
+        self.assertEqual(words, list(self.F))
+        self.assertEqual([r.advance for r in results], [2])
+        self.assertEqual(words, list(self.F))
 
 
 if __name__ == "__main__":
